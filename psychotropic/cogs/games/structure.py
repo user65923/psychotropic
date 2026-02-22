@@ -10,7 +10,7 @@ from discord.app_commands import locale_str as _
 from discord.ext.commands import Cog
 from discord.ui import Button
 import httpx
-from httpx import TimeoutException
+from httpx import HTTPError
 
 from psychotropic import settings
 from psychotropic.cogs.games import BaseRunningGame, ReplayView, games_group
@@ -98,7 +98,7 @@ class SchematicRegistry:
                             "(fetch failed)"
                         )
 
-            except TimeoutException:
+            except HTTPError:
                 log.error(
                     "Unable to reach PsychonautWiki API. "
                     "The schematic cache might be empty or "
@@ -460,7 +460,7 @@ class RunningStructureGame(BaseRunningGame):
             # response is needed in less than 3 seconds when triggered by the game end
             # application command
             substance = await pnwiki.get_substance(self.game.substance, timeout=2)
-        except TimeoutException:
+        except HTTPError:
             log.warning("Unable to reach PsychonautWiki API")
 
         # The PNW API does fuzzy matching, so verify the name matches
