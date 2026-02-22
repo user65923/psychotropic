@@ -1,7 +1,7 @@
 from functools import partial
 from typing import Literal, get_args
 
-from discord import Interaction
+from discord import File, Interaction
 from discord.app_commands import command
 from discord.app_commands import locale_str as _
 from discord.ext.commands import Cog
@@ -13,6 +13,19 @@ from psychotropic.i18n import localize, localize_fmt, set_locale
 from psychotropic.providers import EPAEmbed, PubChemEmbed, dsstox, pubchem
 from psychotropic.ui import DefaultEmbed, RetryModalView
 from psychotropic.utils import pretty_list, setup_cog, to_float
+
+# Cache dir for structure game schematics (PNWiki + psymol)
+_SCHEMATICS_DIR = settings.STORAGE_DIR / "cache" / "schematics"
+
+
+def _find_cached_schematic(substance):
+    """Find a cached schematic PNG by substance name (case-insensitive).
+    Returns the path or None."""
+    lookup = substance.lower()
+    for path in _SCHEMATICS_DIR.glob("*.png"):
+        if path.stem.lower() == lookup:
+            return path
+    return None
 
 Mode = Literal["2D", "3D"]
 
@@ -35,9 +48,22 @@ class SchematicView(View):
             children.disabled = children.label == self.mode
 
         embed = interaction.message.embeds[0]
-        embed.set_image(url=pubchem.get_schematic_url(self.substance, self.mode))
 
-        await interaction.response.edit_message(embed=embed, view=self)
+        # Prefer cached schematic for 2D mode
+        kwargs = {}
+        cached = _find_cached_schematic(self.substance) if self.mode == "2D" else None
+        if cached:
+            kwargs["attachments"] = [File(cached, filename="schematic.png")]
+            embed.set_image(url="attachment://schematic.png")
+        else:
+            kwargs["attachments"] = []
+            embed.set_image(
+                url=pubchem.get_schematic_url(self.substance, self.mode)
+            )
+
+        await interaction.response.edit_message(
+            embed=embed, view=self, **kwargs
+        )
 
 
 class DilutionModal(Modal):
@@ -342,25 +368,36 @@ class ScienceCog(Cog, name="Scientific module"):
         formula = properties["MolecularFormula"]
         iupac_name = properties["IUPACName"]
 
-        schem_url = pubchem.get_schematic_url(substance, mode)
+        embed = PubChemEmbed(
+            title=localize("Substance schematic: ") + synonyms[0].capitalize(),
+        ).add_field(
+            name=localize("🔬 IUPAC Name"),
+            value=iupac_name.capitalize(),
+            inline=False,
+        ).add_field(
+            name=localize("🧪 Formula"),
+            value=f"**{formula}**",
+        )
+
+        # Prefer cached schematic (PNWiki/psymol) for 2D mode
+        cached = _find_cached_schematic(substance) if mode == "2D" else None
+        # Also try the first PubChem synonym (common name)
+        if not cached and mode == "2D" and synonyms:
+            cached = _find_cached_schematic(synonyms[0])
+
+        kwargs = {}
+        if cached:
+            kwargs["file"] = File(cached, filename="schematic.png")
+            embed.set_image(url="attachment://schematic.png")
+        else:
+            embed.set_image(
+                url=pubchem.get_schematic_url(substance, mode)
+            )
 
         await interaction.followup.send(
-            embed=(
-                PubChemEmbed(
-                    title=localize("Substance schematic: ") + synonyms[0].capitalize(),
-                )
-                .add_field(
-                    name=localize("🔬 IUPAC Name"),
-                    value=iupac_name.capitalize(),
-                    inline=False,
-                )
-                .add_field(
-                    name=localize("🧪 Formula"),
-                    value=f"**{formula}**",
-                )
-                .set_image(url=schem_url)
-            ),
+            embed=embed,
             view=SchematicView(substance, mode),
+            **kwargs,
         )
 
     @command(

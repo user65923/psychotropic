@@ -1,53 +1,239 @@
 import asyncio as aio
 import logging
-from random import choice
+import re
+from concurrent.futures import ThreadPoolExecutor
+from secrets import choice
 
 from discord import ButtonStyle, File
 from discord.app_commands import command
 from discord.app_commands import locale_str as _
 from discord.ext.commands import Cog
 from discord.ui import Button
+import httpx
 from httpx import TimeoutException
 
 from psychotropic import settings
 from psychotropic.cogs.games import BaseRunningGame, ReplayView, games_group
 from psychotropic.embeds import DefaultEmbed, ErrorEmbed
 from psychotropic.i18n import localize, localize_fmt, set_locale
-from psychotropic.providers import pnwiki
+from rdkit import Chem
+
+from psychotropic.providers import pnwiki, psymol
 from psychotropic.utils import setup_cog, shuffled, unformat
+
+
+def _canon_smiles(smiles):
+    """Canonicalize SMILES without stereochemistry for dedup."""
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return None
+    return Chem.MolToSmiles(mol, isomericSmiles=False)
 
 log = logging.getLogger(__name__)
 
 
 class SchematicRegistry:
+    MOLFILES_DIR = settings.STORAGE_DIR / "cache" / "molfiles"
+
     def __init__(self, path):
         path.mkdir(parents=True, exist_ok=True)
+        self.MOLFILES_DIR.mkdir(parents=True, exist_ok=True)
 
         self.path = path
         self.schematics = []
+        self.substance_urls = {}
 
     async def fetch_schematics(self):
-        """Populate the list of all substances to play the game with from PNWiki."""
+        """Populate the list of all substances to play the game with from
+        PNWiki (remote SVGs) and psymol (local RDKit generation)."""
         if settings.FETCH_SCHEMATICS:
-            log.info("Populating cache with schematics from PNWiki...")
+            # 1. Fetch PNWiki substances first (best quality)
+            log.info("Fetching schematics from PNWiki...")
 
             try:
-                for substance in await pnwiki.list_substances():
-                    image_path = self.build_schematic_path(substance)
+                raw_names = await pnwiki.list_substances()
+                substances = {
+                    re.sub(r'\s*\(.*?\)', '', n): n
+                    for n in raw_names
+                }
+
+                # Batch-query MediaWiki for actual SVG filenames
+                page_images = await pnwiki.get_page_images(
+                    list(substances.values())
+                )
+                # Map cleaned name -> SVG filename
+                svg_map = {}
+                for clean, raw in substances.items():
+                    svg = page_images.get(raw)
+                    if svg and svg.lower().endswith(".svg"):
+                        svg_map[clean] = svg
+
+                for substance, svg_file in svg_map.items():
+                    image_path = self.build_schematic_path(
+                        substance
+                    )
                     if image_path.exists():
+                        log.info(
+                            f"[pnwiki] Skipped {substance} "
+                            "(cached)"
+                        )
                         continue
 
                     image = await pnwiki.get_schematic_image(
-                        substance, width=600, background_color="WHITE"
+                        svg_file, width=600,
+                        background_color="WHITE",
                     )
                     if image:
                         image.save(image_path)
+                        log.info(
+                            f"[pnwiki] Fetched {substance} "
+                            f"({svg_file})"
+                        )
+                    else:
+                        log.info(
+                            f"[pnwiki] Skipped {substance} "
+                            "(fetch failed)"
+                        )
 
             except TimeoutException:
                 log.error(
-                    "Unable to reach PsychonautWiki API. The schematic cache might be "
-                    "empty or incomplete."
+                    "Unable to reach PsychonautWiki API. "
+                    "The schematic cache might be empty or "
+                    "incomplete."
                 )
+
+            # 2. Fill gaps with psymol (RDKit generation)
+            psymol_substances = psymol.load_substances()
+            log.info(
+                f"Generating missing schematics from "
+                f"{len(psymol_substances)} psymol substances..."
+            )
+
+            # 2a. Fetch molfiles from isomerdesign
+            # (by URL if available, otherwise search by name)
+            async with httpx.AsyncClient(
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=10,
+            ) as client:
+                for name, row in psymol_substances.items():
+                    mol_path = self.MOLFILES_DIR / f"{name}.mol"
+                    if mol_path.exists():
+                        log.info(
+                            f"[molfile] Skipped {name} "
+                            "(cached)"
+                        )
+                        continue
+
+                    url = row.get('url', '')
+                    source = url or name
+                    molblock = await psymol.fetch_molfile(
+                        source, client=client
+                    )
+                    if molblock:
+                        mol_path.write_text(molblock)
+                        log.info(
+                            f"[molfile] Fetched {name}"
+                        )
+                    else:
+                        log.info(
+                            f"[molfile] Skipped {name} "
+                            "(not found)"
+                        )
+
+            # 2b. Deduplicate by canonical SMILES,
+            # prefer PNWiki images already in cache
+            seen_smiles = set()
+
+            # Mark SMILES as seen for any cached PNG
+            for name, row in psymol_substances.items():
+                smiles = row.get('smiles')
+                if not smiles:
+                    continue
+                image_path = self.build_schematic_path(name)
+                if image_path.exists():
+                    canon = _canon_smiles(smiles)
+                    if canon:
+                        seen_smiles.add(canon)
+
+            # 2c. Generate images using molfiles or SMILES
+            to_generate = {}
+            for name, row in psymol_substances.items():
+                if row.get('url'):
+                    self.substance_urls[name] = row['url']
+
+                image_path = self.build_schematic_path(name)
+                if image_path.exists():
+                    log.info(f"[psymol] Skipped {name} (cached)")
+                    continue
+
+                smiles = row.get('smiles')
+                if smiles:
+                    canon = _canon_smiles(smiles)
+                    if canon and canon in seen_smiles:
+                        log.info(
+                            f"[psymol] Skipped {name} "
+                            "(duplicate SMILES)"
+                        )
+                        continue
+                    if canon:
+                        seen_smiles.add(canon)
+
+                mol_path = self.MOLFILES_DIR / f"{name}.mol"
+
+                if not mol_path.exists() and not smiles:
+                    log.info(
+                        f"[psymol] Skipped {name} "
+                        "(no molfile or SMILES)"
+                    )
+                    continue
+
+                to_generate[name] = (
+                    smiles, image_path, mol_path
+                )
+
+            def _generate(name, smiles, path, mol_path):
+                image = None
+
+                # Prefer molfile coordinates
+                if mol_path.exists():
+                    molblock = mol_path.read_text()
+                    image = psymol.generate_from_molfile(
+                        molblock
+                    )
+                    if image:
+                        log.info(
+                            f"[psymol] Generated {name} "
+                            "(from molfile)"
+                        )
+
+                # Fall back to SMILES + CoordGen
+                if not image and smiles:
+                    image = psymol.generate_schematic_image(
+                        smiles
+                    )
+                    if image:
+                        log.info(
+                            f"[psymol] Generated {name} "
+                            "(from SMILES)"
+                        )
+
+                if image:
+                    image.save(path)
+                else:
+                    log.warning(
+                        f"[psymol] Failed to generate {name}"
+                    )
+
+            loop = aio.get_running_loop()
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                await aio.gather(*(
+                    loop.run_in_executor(
+                        pool, _generate, name,
+                        smiles, path, mol_path
+                    )
+                    for name, (smiles, path, mol_path)
+                    in to_generate.items()
+                ))
 
         self.schematics = list(self.path.glob("*.png"))
 
@@ -274,14 +460,22 @@ class RunningStructureGame(BaseRunningGame):
         except TimeoutException:
             log.warning("Unable to reach PsychonautWiki API")
 
-        # The PNW API might not return data if the substance is a draft
-        if substance:
+        # The PNW API does fuzzy matching, so verify the name matches
+        url = None
+        if substance and substance["name"] == self.game.substance:
+            url = substance["url"]
+
+        # Fall back to psymol URL for substances not on PNWiki
+        if not url:
+            url = self.game.schematic_registry.substance_urls.get(self.game.substance)
+
+        if url:
             view.add_item(
                 Button(
                     label=localize("What's that?"),
                     style=ButtonStyle.url,
                     emoji="🌐",
-                    url=substance["url"],
+                    url=url,
                 )
             )
 
