@@ -1,7 +1,8 @@
 services:
   bot:
     build: .
-    env_file: .env
+    environment:
+      - DISCORD_TOKEN=${DISCORD_TOKEN}
     volumes:
       - ./storage:/app/storage
     restart: unless-stopped
