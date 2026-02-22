@@ -53,7 +53,7 @@ class SchematicRegistry:
             try:
                 raw_names = await pnwiki.list_substances()
                 substances = {
-                    re.sub(r'\s*\(.*?\)', '', n): n
+                    re.sub(r'\s+\([^)]*\)$', '', n): n
                     for n in raw_names
                 }
 
@@ -68,26 +68,29 @@ class SchematicRegistry:
                     if svg and svg.lower().endswith(".svg"):
                         svg_map[clean] = svg
 
+                # Filter out already-cached substances
+                to_fetch = {}
                 for substance, svg_file in svg_map.items():
-                    image_path = self.build_schematic_path(
-                        substance
-                    )
+                    image_path = self.build_schematic_path(substance)
                     if image_path.exists():
                         log.info(
-                            f"[pnwiki] Skipped {substance} "
-                            "(cached)"
+                            f"[pnwiki] Skipped {substance} (cached)"
                         )
-                        continue
+                    else:
+                        to_fetch[substance] = svg_file
 
-                    image = await pnwiki.get_schematic_image(
-                        svg_file, width=600,
-                        background_color="WHITE",
-                    )
+                # Batch-fetch all missing schematics concurrently
+                images = await pnwiki.fetch_schematic_images(
+                    to_fetch, width=600, background_color="WHITE",
+                )
+                for substance, image in images.items():
                     if image:
-                        image.save(image_path)
+                        image.save(
+                            self.build_schematic_path(substance)
+                        )
                         log.info(
                             f"[pnwiki] Fetched {substance} "
-                            f"({svg_file})"
+                            f"({to_fetch[substance]})"
                         )
                     else:
                         log.info(
