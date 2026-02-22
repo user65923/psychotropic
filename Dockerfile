@@ -6,7 +6,8 @@ ENV UV_COMPILE_BYTECODE=1
 ENV UV_LINK_MODE=copy
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc libc6-dev zlib1g-dev libjpeg-dev libfreetype-dev && \
+    gcc libc6-dev zlib1g-dev libjpeg-dev libfreetype-dev \
+    libxrender1 libxext6 && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
